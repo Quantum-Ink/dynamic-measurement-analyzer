@@ -1,2629 +1,1547 @@
+# -*- coding: utf-8 -*-
+
 """
-Dynamic Experiment Data Analyzer v3.1
-======================================
-
-动态测量数据分析工具
-
-数据源：
-1. CSV
-2. Excel
-3. C++ Sensor Data Backend API
+Dynamic Measurement Analyzer
+实时多传感器测量分析器 v5.0
 
 主要功能：
-- CSV / Excel / C++ API 数据导入
-- Excel Sheet 选择
-- 数据列选择
-- C++ API timestamp + value 解析
-- 数据预览
-- 基础统计分析
-- 移动平均滤波
-- 动态响应分析
-- 动态响应曲线
-
-作者：Measurement & Control Project
+1. 多传感器选择
+2. 实时 API 数据刷新
+3. 暂停 / 继续
+4. 暂停后自动追赶历史数据
+5. 实时曲线
+6. 实时数据表格
+7. 传感器状态卡片
+8. CSV 导出
+9. Hampel 异常检测
+10. 移动平均滤波
+11. 实时采样率
+12. 平均值 / 标准差
+13. API 自动重连
+14. 高清 Matplotlib UI
+15. 不强制窗口置顶
 """
 
-
-# ============================================================
-# 0. 导入模块
-# ============================================================
-
 import csv
-import json
 import os
+import time
 import statistics
+import requests
 
-import tkinter as tk
-
-from tkinter import (
-    filedialog,
-    messagebox,
-    ttk
-)
-
-from dataclasses import dataclass
-
-from urllib.request import (
-    Request,
-    urlopen
-)
-
-from urllib.error import (
-    URLError,
-    HTTPError
-)
-
+from collections import deque
 from datetime import datetime
+
+import matplotlib
+
+# ============================================================
+# 中文字体
+# ============================================================
+
+matplotlib.rcParams["font.sans-serif"] = [
+    "Microsoft YaHei",
+    "SimHei",
+    "Noto Sans CJK SC",
+    "Arial Unicode MS"
+]
+
+matplotlib.rcParams["axes.unicode_minus"] = False
+
+matplotlib.rcParams["figure.dpi"] = 120
+matplotlib.rcParams["savefig.dpi"] = 180
 
 import matplotlib.pyplot as plt
 
-from openpyxl import load_workbook
+from matplotlib.animation import FuncAnimation
+from matplotlib.widgets import Button, RadioButtons
+from matplotlib.ticker import MaxNLocator
+from matplotlib.gridspec import GridSpec
 
 
 # ============================================================
-# 1. 实验配置
+# 配置
 # ============================================================
 
-@dataclass
-class ExperimentConfig:
+API_BASE_URL = "http://127.0.0.1:18080"
 
-    # 移动平均窗口
-    windows: tuple = (
-        3,
-        5,
-        10,
-        20
-    )
+REFRESH_INTERVAL = 1000
 
-    # 真实变化点
-    true_change_index: int = 101
+MAX_POINTS = 150
 
-    # 变化前真实值
-    true_value_before: float = 125.0
+FILTER_WINDOW = 5
 
-    # 变化后真实值
-    true_value_after: float = 130.0
+REQUEST_TIMEOUT = 2
 
-    # C++ API
-    api_url: str = (
-        "http://localhost:8080/"
-        "sensors/Measurement/data"
-    )
-
-
-CONFIG = ExperimentConfig()
+TABLE_ROWS = 8
 
 
 # ============================================================
-# 2. GUI 字体
+# API Session
 # ============================================================
 
-FONT_NORMAL = (
-    "Microsoft YaHei",
-    10
-)
-
-FONT_TITLE = (
-    "Microsoft YaHei",
-    15,
-    "bold"
-)
-
-FONT_HEADER = (
-    "Microsoft YaHei",
-    11,
-    "bold"
-)
+session = requests.Session()
 
 
 # ============================================================
-# 3. GUI 工具
+# API
 # ============================================================
 
-class GUIHelper:
+def get_sensors():
 
-    def __init__(
-        self,
-        root
-    ):
+    response = session.get(
+        f"{API_BASE_URL}/sensors",
+        timeout=REQUEST_TIMEOUT
+    )
 
-        self.root = root
+    response.raise_for_status()
 
-    # --------------------------------------------------------
-    # 窗口居中
-    # --------------------------------------------------------
+    result = response.json()
 
-    @staticmethod
-    def center_window(
-        window,
-        width,
-        height
-    ):
+    return result.get(
+        "sensors",
+        []
+    )
 
-        screen_width = (
-            window.winfo_screenwidth()
-        )
 
-        screen_height = (
-            window.winfo_screenheight()
-        )
+def get_sensor_data(sensor_name):
 
-        x = (
-            screen_width - width
-        ) // 2
+    response = session.get(
+        f"{API_BASE_URL}/sensors/{sensor_name}/data",
+        timeout=REQUEST_TIMEOUT
+    )
 
-        y = (
-            screen_height - height
-        ) // 2
+    response.raise_for_status()
 
-        window.geometry(
-            f"{width}x{height}+{x}+{y}"
-        )
-
-    # --------------------------------------------------------
-    # 创建窗口
-    # --------------------------------------------------------
-
-    def create_window(
-        self,
-        title,
-        width,
-        height
-    ):
-
-        window = tk.Toplevel(
-            self.root
-        )
-
-        window.title(
-            title
-        )
-
-        self.center_window(
-            window,
-            width,
-            height
-        )
-
-        window.resizable(
-            False,
-            False
-        )
-
-        return window
+    return response.json()
 
 
 # ============================================================
-# 4. 数据读取模块
+# Hampel
 # ============================================================
 
-class DataLoader:
-
-    # --------------------------------------------------------
-    # 获取文件扩展名
-    # --------------------------------------------------------
-
-    @staticmethod
-    def get_extension(
-        file_path
-    ):
-
-        return os.path.splitext(
-            file_path
-        )[1].lower()
-
-    # ========================================================
-    # CSV
-    # ========================================================
-
-    @staticmethod
-    def get_csv_headers(
-        file_path
-    ):
-
-        with open(
-            file_path,
-            "r",
-            encoding="utf-8-sig",
-            newline=""
-        ) as file:
-
-            reader = csv.DictReader(
-                file
-            )
-
-            if not reader.fieldnames:
-
-                raise ValueError(
-                    "CSV 文件没有找到表头。"
-                )
-
-            return list(
-                reader.fieldnames
-            )
-
-    # --------------------------------------------------------
-    # 读取 CSV
-    # --------------------------------------------------------
-
-    @staticmethod
-    def load_csv(
-        file_path,
-        column_name
-    ):
-
-        data = []
-
-        with open(
-            file_path,
-            "r",
-            encoding="utf-8-sig",
-            newline=""
-        ) as file:
-
-            reader = csv.DictReader(
-                file
-            )
-
-            if not reader.fieldnames:
-
-                raise ValueError(
-                    "CSV 文件没有找到表头。"
-                )
-
-            if column_name not in (
-                reader.fieldnames
-            ):
-
-                raise ValueError(
-                    f"CSV 中没有找到列："
-                    f"{column_name}"
-                )
-
-            for row in reader:
-
-                value = row.get(
-                    column_name
-                )
-
-                try:
-
-                    if value not in (
-                        None,
-                        ""
-                    ):
-
-                        data.append(
-                            float(value)
-                        )
-
-                except (
-                    ValueError,
-                    TypeError
-                ):
-
-                    continue
-
-        return data
-
-    # ========================================================
-    # Excel
-    # ========================================================
-
-    @staticmethod
-    def get_excel_sheets(
-        file_path
-    ):
-
-        workbook = load_workbook(
-            file_path,
-            read_only=True,
-            data_only=True
-        )
-
-        sheets = (
-            workbook.sheetnames
-        )
-
-        workbook.close()
-
-        return sheets
-
-    # --------------------------------------------------------
-    # Excel 表头
-    # --------------------------------------------------------
-
-    @staticmethod
-    def get_excel_headers(
-        file_path,
-        sheet_name
-    ):
-
-        workbook = load_workbook(
-            file_path,
-            read_only=True,
-            data_only=True
-        )
-
-        sheet = workbook[
-            sheet_name
-        ]
-
-        headers = next(
-            sheet.iter_rows(
-                min_row=1,
-                max_row=1,
-                values_only=True
-            ),
-            ()
-        )
-
-        workbook.close()
-
-        return [
-            value
-            for value in headers
-            if value is not None
-        ]
-
-    # --------------------------------------------------------
-    # Excel 数据
-    # --------------------------------------------------------
-
-    @staticmethod
-    def load_excel(
-        file_path,
-        sheet_name,
-        column_name
-    ):
-
-        data = []
-
-        workbook = load_workbook(
-            file_path,
-            read_only=True,
-            data_only=True
-        )
-
-        sheet = workbook[
-            sheet_name
-        ]
-
-        headers = list(
-            next(
-                sheet.iter_rows(
-                    min_row=1,
-                    max_row=1,
-                    values_only=True
-                ),
-                ()
-            )
-        )
-
-        if column_name not in headers:
-
-            workbook.close()
-
-            raise ValueError(
-                f"Excel 中没有找到列："
-                f"{column_name}"
-            )
-
-        column_index = (
-            headers.index(
-                column_name
-            )
-        )
-
-        for row in sheet.iter_rows(
-            min_row=2,
-            values_only=True
-        ):
-
-            if (
-                column_index
-                >= len(row)
-            ):
-
-                continue
-
-            value = row[
-                column_index
-            ]
-
-            try:
-
-                if value is not None:
-
-                    data.append(
-                        float(value)
-                    )
-
-            except (
-                ValueError,
-                TypeError
-            ):
-
-                continue
-
-        workbook.close()
-
-        return data
-
-    # ========================================================
-    # C++ API
-    # ========================================================
-
-    @staticmethod
-    def load_api(
-        url
-    ):
-
-        request = Request(
-
-            url,
-
-            headers={
-                "Accept":
-                "application/json"
-            },
-
-            method="GET"
-
-        )
-
-        # ----------------------------------------------------
-        # 请求 API
-        # ----------------------------------------------------
-
-        try:
-
-            with urlopen(
-                request,
-                timeout=5
-            ) as response:
-
-                raw_data = (
-                    response
-                    .read()
-                    .decode("utf-8")
-                )
-
-                result = json.loads(
-                    raw_data
-                )
-
-        except HTTPError as error:
-
-            raise RuntimeError(
-                f"API HTTP 错误："
-                f"{error.code}"
-            )
-
-        except URLError as error:
-
-            raise RuntimeError(
-
-                "无法连接 C++ 后端。\n\n"
-
-                "请确认：\n"
-
-                "1. SensorDataBackend.exe "
-                "正在运行\n"
-
-                "2. API 端口为 8080\n"
-
-                "3. API 地址正确\n\n"
-
-                f"当前地址：{url}"
-
-            ) from error
-
-        except Exception as error:
-
-            raise RuntimeError(
-                f"API 数据读取失败："
-                f"{error}"
-            ) from error
-
-        # ----------------------------------------------------
-        # 解析数据
-        # ----------------------------------------------------
-
-        records = []
-
-        api_data = result.get(
-            "data",
-            []
-        )
-
-        for item in api_data:
-
-            try:
-
-                # --------------------------------------------
-                # 标准格式
-                #
-                # {
-                #     "timestamp": "...",
-                #     "value": 125.36
-                # }
-                # --------------------------------------------
-
-                if isinstance(
-                    item,
-                    dict
-                ):
-
-                    value = float(
-                        item["value"]
-                    )
-
-                    timestamp = (
-                        item.get(
-                            "timestamp"
-                        )
-                    )
-
-                # --------------------------------------------
-                # 兼容：
-                #
-                # {
-                #     "data": [125.3, 126.4]
-                # }
-                # --------------------------------------------
-
-                else:
-
-                    value = float(
-                        item
-                    )
-
-                    timestamp = None
-
-                records.append({
-
-                    "timestamp":
-                        timestamp,
-
-                    "value":
-                        value
-
-                })
-
-            except (
-                KeyError,
-                ValueError,
-                TypeError
-            ):
-
-                continue
-
-        # ----------------------------------------------------
-        # 检查
-        # ----------------------------------------------------
-
-        if not records:
-
-            raise ValueError(
-                "API 没有返回有效测量数据。"
-            )
-
-        return records
-
-
-# ============================================================
-# 5. 通用列表选择窗口
-# ============================================================
-
-def select_from_list(
-    gui,
-    title,
-    description,
-    items,
-    width=600,
-    height=450
-):
-
-    result = {
-        "value": None
-    }
-
-    window = gui.create_window(
-        title,
-        width,
-        height
-    )
-
-    tk.Label(
-        window,
-        text=title,
-        font=FONT_TITLE
-    ).pack(
-        pady=(20, 5)
-    )
-
-    tk.Label(
-        window,
-        text=description,
-        font=FONT_NORMAL
-    ).pack(
-        pady=(0, 15)
-    )
-
-    frame = tk.Frame(
-        window
-    )
-
-    frame.pack(
-        fill="both",
-        expand=True,
-        padx=25
-    )
-
-    scrollbar = ttk.Scrollbar(
-        frame,
-        orient="vertical"
-    )
-
-    scrollbar.pack(
-        side="right",
-        fill="y"
-    )
-
-    tree = ttk.Treeview(
-
-        frame,
-
-        columns=(
-            "value",
-        ),
-
-        show="headings",
-
-        selectmode="browse",
-
-        yscrollcommand=(
-            scrollbar.set
-        )
-
-    )
-
-    tree.heading(
-        "value",
-        text="名称"
-    )
-
-    tree.column(
-        "value",
-        width=480
-    )
-
-    tree.pack(
-        side="left",
-        fill="both",
-        expand=True
-    )
-
-    scrollbar.config(
-        command=tree.yview
-    )
-
-    for item in items:
-
-        tree.insert(
-            "",
-            tk.END,
-            values=(
-                str(item),
-            )
-        )
-
-    if items:
-
-        first = (
-            tree.get_children()[0]
-        )
-
-        tree.selection_set(
-            first
-        )
-
-        tree.focus(
-            first
-        )
-
-    # --------------------------------------------------------
-    # 确定
-    # --------------------------------------------------------
-
-    def confirm():
-
-        selection = (
-            tree.selection()
-        )
-
-        if not selection:
-
-            messagebox.showwarning(
-
-                "提示",
-
-                "请选择一个项目。",
-
-                parent=window
-
-            )
-
-            return
-
-        result["value"] = (
-            tree.item(
-                selection[0],
-                "values"
-            )[0]
-        )
-
-        window.destroy()
-
-    # --------------------------------------------------------
-    # 取消
-    # --------------------------------------------------------
-
-    def cancel():
-
-        result["value"] = None
-
-        window.destroy()
-
-    tree.bind(
-        "<Double-Button-1>",
-        lambda event: confirm()
-    )
-
-    window.bind(
-        "<Return>",
-        lambda event: confirm()
-    )
-
-    window.bind(
-        "<Escape>",
-        lambda event: cancel()
-    )
-
-    buttons = tk.Frame(
-        window
-    )
-
-    buttons.pack(
-        pady=20
-    )
-
-    tk.Button(
-        buttons,
-        text="确定",
-        command=confirm,
-        width=12,
-        font=FONT_NORMAL
-    ).pack(
-        side="left",
-        padx=10
-    )
-
-    tk.Button(
-        buttons,
-        text="取消",
-        command=cancel,
-        width=12,
-        font=FONT_NORMAL
-    ).pack(
-        side="left",
-        padx=10
-    )
-
-    window.grab_set()
-
-    window.focus_force()
-
-    gui.root.wait_window(
-        window
-    )
-
-    return result["value"]
-
-
-# ============================================================
-# 6. 数据源选择
-# ============================================================
-
-def select_data_source(
-    gui
-):
-
-    result = {
-        "value": None
-    }
-
-    window = gui.create_window(
-        "选择数据源",
-        560,
-        430
-    )
-
-    tk.Label(
-        window,
-        text="选择数据源",
-        font=FONT_TITLE
-    ).pack(
-        pady=(30, 10)
-    )
-
-    tk.Label(
-        window,
-        text="请选择本次实验的数据来源：",
-        font=FONT_NORMAL
-    ).pack(
-        pady=(0, 25)
-    )
-
-    source = tk.StringVar(
-        value="Excel"
-    )
-
-    options = [
-
-        (
-            "CSV 文件",
-            "CSV"
-        ),
-
-        (
-            "Excel 文件",
-            "Excel"
-        ),
-
-        (
-            "C++ 实时 API",
-            "API"
-        )
-
-    ]
-
-    for text, value in options:
-
-        tk.Radiobutton(
-
-            window,
-
-            text=text,
-
-            variable=source,
-
-            value=value,
-
-            font=FONT_NORMAL
-
-        ).pack(
-
-            anchor="w",
-
-            padx=130,
-
-            pady=8
-
-        )
-
-    # --------------------------------------------------------
-    # 确定
-    # --------------------------------------------------------
-
-    def confirm():
-
-        result["value"] = (
-            source.get()
-        )
-
-        window.destroy()
-
-    # --------------------------------------------------------
-    # 取消
-    # --------------------------------------------------------
-
-    def cancel():
-
-        result["value"] = None
-
-        window.destroy()
-
-    buttons = tk.Frame(
-        window
-    )
-
-    buttons.pack(
-        pady=30
-    )
-
-    tk.Button(
-        buttons,
-        text="确定",
-        command=confirm,
-        width=14,
-        font=FONT_NORMAL
-    ).pack(
-        side="left",
-        padx=10
-    )
-
-    tk.Button(
-        buttons,
-        text="取消",
-        command=cancel,
-        width=14,
-        font=FONT_NORMAL
-    ).pack(
-        side="left",
-        padx=10
-    )
-
-    window.bind(
-        "<Return>",
-        lambda e: confirm()
-    )
-
-    window.bind(
-        "<Escape>",
-        lambda e: cancel()
-    )
-
-    window.grab_set()
-
-    window.focus_force()
-
-    gui.root.wait_window(
-        window
-    )
-
-    return result["value"]
-
-
-# ============================================================
-# 7. 实验参数
-# ============================================================
-
-def experiment_parameter_window(
-    gui,
-    config
-):
-
-    result = {
-        "confirmed": False
-    }
-
-    window = gui.create_window(
-        "实验参数设置",
-        600,
-        520
-    )
-
-    tk.Label(
-        window,
-        text="实验参数设置",
-        font=FONT_TITLE
-    ).pack(
-        pady=(25, 5)
-    )
-
-    tk.Label(
-        window,
-        text="请输入本次实验的真实参数",
-        font=FONT_NORMAL
-    ).pack(
-        pady=(0, 20)
-    )
-
-    frame = tk.Frame(
-        window
-    )
-
-    frame.pack(
-        padx=60,
-        fill="x"
-    )
-
-    before_var = tk.StringVar(
-        value=str(
-            config.true_value_before
-        )
-    )
-
-    after_var = tk.StringVar(
-        value=str(
-            config.true_value_after
-        )
-    )
-
-    change_var = tk.StringVar(
-        value=str(
-            config.true_change_index
-        )
-    )
-
-    windows_var = tk.StringVar(
-
-        value=",".join(
-
-            map(
-                str,
-                config.windows
-            )
-
-        )
-
-    )
-
-    fields = [
-
-        (
-            "变化前真实值：",
-            before_var,
-            "mm"
-        ),
-
-        (
-            "变化后真实值：",
-            after_var,
-            "mm"
-        ),
-
-        (
-            "真实变化点：",
-            change_var,
-            "sample"
-        ),
-
-        (
-            "滤波窗口：",
-            windows_var,
-            "例如 3,5,10,20"
-        )
-
-    ]
-
-    for row, (
-        label,
-        variable,
-        unit
-    ) in enumerate(fields):
-
-        tk.Label(
-            frame,
-            text=label,
-            font=FONT_HEADER
-        ).grid(
-            row=row,
-            column=0,
-            sticky="w",
-            pady=10
-        )
-
-        tk.Entry(
-            frame,
-            textvariable=variable,
-            width=20,
-            font=FONT_NORMAL
-        ).grid(
-            row=row,
-            column=1,
-            padx=10
-        )
-
-        tk.Label(
-            frame,
-            text=unit,
-            font=FONT_NORMAL
-        ).grid(
-            row=row,
-            column=2
-        )
-
-    # --------------------------------------------------------
-    # 确定
-    # --------------------------------------------------------
-
-    def confirm():
-
-        try:
-
-            before = float(
-                before_var.get()
-            )
-
-            after = float(
-                after_var.get()
-            )
-
-            change_index = int(
-                change_var.get()
-            )
-
-            windows = tuple(
-
-                int(
-                    x.strip()
-                )
-
-                for x in
-                windows_var.get().split(",")
-
-                if x.strip()
-
-            )
-
-            if not windows:
-
-                raise ValueError(
-                    "至少需要一个滤波窗口。"
-                )
-
-            if any(
-                x <= 0
-                for x in windows
-            ):
-
-                raise ValueError(
-                    "滤波窗口必须大于 0。"
-                )
-
-            if change_index < 1:
-
-                raise ValueError(
-                    "变化点必须大于 0。"
-                )
-
-            config.true_value_before = (
-                before
-            )
-
-            config.true_value_after = (
-                after
-            )
-
-            config.true_change_index = (
-                change_index
-            )
-
-            config.windows = (
-                windows
-            )
-
-            result["confirmed"] = True
-
-            window.destroy()
-
-        except ValueError as error:
-
-            messagebox.showerror(
-                "参数错误",
-                str(error),
-                parent=window
-            )
-
-    # --------------------------------------------------------
-    # 取消
-    # --------------------------------------------------------
-
-    def cancel():
-
-        window.destroy()
-
-    buttons = tk.Frame(
-        window
-    )
-
-    buttons.pack(
-        pady=30
-    )
-
-    tk.Button(
-        buttons,
-        text="确定",
-        command=confirm,
-        width=14,
-        font=FONT_NORMAL
-    ).pack(
-        side="left",
-        padx=10
-    )
-
-    tk.Button(
-        buttons,
-        text="取消",
-        command=cancel,
-        width=14,
-        font=FONT_NORMAL
-    ).pack(
-        side="left",
-        padx=10
-    )
-
-    window.bind(
-        "<Return>",
-        lambda e: confirm()
-    )
-
-    window.bind(
-        "<Escape>",
-        lambda e: cancel()
-    )
-
-    window.grab_set()
-
-    window.focus_force()
-
-    gui.root.wait_window(
-        window
-    )
-
-    return result["confirmed"]
-
-
-# ============================================================
-# 8. 数据预览
-# ============================================================
-
-def preview_data(
-    gui,
-    source_name,
-    file_path,
-    sheet_name,
-    column_name,
+def hampel_is_anomaly(
     data,
-    timestamps=None
+    new_value,
+    window_size=7,
+    threshold=3.0
 ):
 
-    result = {
-        "continue": False
-    }
+    if len(data) < window_size:
 
-    if timestamps is None:
+        return False
 
-        timestamps = []
+    recent = list(data)[-window_size:]
 
-    window = gui.create_window(
-        "数据预览",
-        850,
-        680
+    median_value = statistics.median(
+        recent
     )
 
-    tk.Label(
-        window,
-        text="测量数据预览",
-        font=FONT_TITLE
-    ).pack(
-        pady=(20, 10)
+    deviations = [
+        abs(x - median_value)
+        for x in recent
+    ]
+
+    mad = statistics.median(
+        deviations
     )
 
-    # --------------------------------------------------------
-    # 文件信息
-    # --------------------------------------------------------
+    if mad == 0:
 
-    if source_name == "API":
-
-        info = (
-
-            "数据源：C++ Sensor Data Backend\n"
-
-            f"API：{CONFIG.api_url}\n"
-
-            f"样本数量：{len(data)}"
-
+        return (
+            abs(
+                new_value -
+                median_value
+            ) > 0.001
         )
 
-    else:
+    robust_sigma = (
+        1.4826 * mad
+    )
 
-        info = (
-
-            f"文件："
-            f"{os.path.basename(file_path)}\n"
-
-            f"Sheet：{sheet_name}\n"
-
-            f"数据列：{column_name}\n"
-
-            f"数据数量：{len(data)}"
-
+    return (
+        abs(
+            new_value -
+            median_value
         )
-
-    tk.Label(
-        window,
-        text=info,
-        font=FONT_NORMAL,
-        justify="left",
-        anchor="w"
-    ).pack(
-        anchor="w",
-        padx=30,
-        pady=(0, 15)
+        >
+        threshold *
+        robust_sigma
     )
-
-    # --------------------------------------------------------
-    # 表格
-    # --------------------------------------------------------
-
-    frame = tk.Frame(
-        window
-    )
-
-    frame.pack(
-        fill="both",
-        expand=True,
-        padx=30
-    )
-
-    scrollbar = ttk.Scrollbar(
-        frame,
-        orient="vertical"
-    )
-
-    scrollbar.pack(
-        side="right",
-        fill="y"
-    )
-
-    if source_name == "API":
-
-        columns = (
-            "index",
-            "timestamp",
-            "value"
-        )
-
-        tree = ttk.Treeview(
-
-            frame,
-
-            columns=columns,
-
-            show="headings",
-
-            yscrollcommand=(
-                scrollbar.set
-            )
-
-        )
-
-        tree.heading(
-            "index",
-            text="序号"
-        )
-
-        tree.heading(
-            "timestamp",
-            text="时间戳"
-        )
-
-        tree.heading(
-            "value",
-            text="测量值"
-        )
-
-        tree.column(
-            "index",
-            width=70,
-            anchor="center"
-        )
-
-        tree.column(
-            "timestamp",
-            width=220,
-            anchor="center"
-        )
-
-        tree.column(
-            "value",
-            width=180,
-            anchor="center"
-        )
-
-        for index, value in enumerate(
-            data[:100],
-            start=1
-        ):
-
-            timestamp = ""
-
-            if (
-                index - 1
-                < len(timestamps)
-            ):
-
-                timestamp = (
-                    timestamps[
-                        index - 1
-                    ]
-                    or ""
-                )
-
-            tree.insert(
-                "",
-                tk.END,
-                values=(
-                    index,
-                    timestamp,
-                    f"{value:.6f}"
-                )
-            )
-
-    else:
-
-        columns = (
-            "index",
-            "value"
-        )
-
-        tree = ttk.Treeview(
-
-            frame,
-
-            columns=columns,
-
-            show="headings",
-
-            yscrollcommand=(
-                scrollbar.set
-            )
-
-        )
-
-        tree.heading(
-            "index",
-            text="序号"
-        )
-
-        tree.heading(
-            "value",
-            text=column_name
-        )
-
-        tree.column(
-            "index",
-            width=100,
-            anchor="center"
-        )
-
-        tree.column(
-            "value",
-            width=520,
-            anchor="center"
-        )
-
-        for index, value in enumerate(
-            data[:100],
-            start=1
-        ):
-
-            tree.insert(
-                "",
-                tk.END,
-                values=(
-                    index,
-                    f"{value:.6f}"
-                )
-            )
-
-    tree.pack(
-        side="left",
-        fill="both",
-        expand=True
-    )
-
-    scrollbar.config(
-        command=tree.yview
-    )
-
-    # --------------------------------------------------------
-    # 统计
-    # --------------------------------------------------------
-
-    mean_value = (
-        statistics.mean(data)
-    )
-
-    tk.Label(
-
-        window,
-
-        text=(
-
-            f"最小值："
-            f"{min(data):.4f}    "
-
-            f"最大值："
-            f"{max(data):.4f}    "
-
-            f"平均值："
-            f"{mean_value:.4f}"
-
-        ),
-
-        font=FONT_HEADER
-
-    ).pack(
-        pady=15
-    )
-
-    # --------------------------------------------------------
-    # 操作
-    # --------------------------------------------------------
-
-    def start():
-
-        result["continue"] = True
-
-        window.destroy()
-
-    def cancel():
-
-        result["continue"] = False
-
-        window.destroy()
-
-    buttons = tk.Frame(
-        window
-    )
-
-    buttons.pack(
-        pady=10
-    )
-
-    tk.Button(
-        buttons,
-        text="开始分析",
-        command=start,
-        width=12,
-        font=FONT_NORMAL
-    ).pack(
-        side="left",
-        padx=10
-    )
-
-    tk.Button(
-        buttons,
-        text="取消",
-        command=cancel,
-        width=12,
-        font=FONT_NORMAL
-    ).pack(
-        side="left",
-        padx=10
-    )
-
-    window.bind(
-        "<Return>",
-        lambda e: start()
-    )
-
-    window.bind(
-        "<Escape>",
-        lambda e: cancel()
-    )
-
-    window.grab_set()
-
-    window.focus_force()
-
-    gui.root.wait_window(
-        window
-    )
-
-    return result["continue"]
 
 
 # ============================================================
-# 9. 数据分析
+# Sensor Buffer
 # ============================================================
 
-class DataAnalyzer:
+def create_sensor_buffer():
 
-    def __init__(
-        self,
-        config
-    ):
+    return {
 
-        self.config = config
+        "timestamps":
+            deque(maxlen=MAX_POINTS),
 
-    # --------------------------------------------------------
-    # 基础分析
-    # --------------------------------------------------------
+        "raw":
+            deque(maxlen=MAX_POINTS),
 
-    def calculate(
-        self,
-        data
-    ):
+        "filtered":
+            deque(maxlen=MAX_POINTS),
 
-        if not data:
+        "all_raw":
+            [],
 
-            raise ValueError(
-                "没有可分析的数据。"
-            )
+        "all_filtered":
+            [],
 
-        mean_value = (
-            statistics.mean(data)
-        )
+        "filter_buffer":
+            deque(maxlen=FILTER_WINDOW),
 
-        if len(data) > 1:
+        "last_timestamp":
+            None,
 
-            std_value = (
-                statistics.stdev(data)
-            )
+        "last_value":
+            0.0,
 
-        else:
+        "last_filtered":
+            0.0,
 
-            std_value = 0.0
+        "unit":
+            "mm",
 
-        minimum = min(data)
+        "status":
+            "等待数据",
 
-        maximum = max(data)
+        "rate":
+            0.0,
 
-        peak_to_peak = (
-            maximum - minimum
-        )
-
-        before = (
-            self.config
-            .true_value_before
-        )
-
-        after = (
-            self.config
-            .true_value_after
-        )
-
-        change = (
-            after - before
-        )
-
-        change_index = (
-            self.config
-            .true_change_index
-        )
-
-        # ----------------------------------------------------
-        # 最大绝对误差
-        # ----------------------------------------------------
-
-        maximum_error = 0.0
-
-        for index, value in enumerate(
-            data
-        ):
-
-            reference = (
-
-                before
-
-                if index < change_index
-
-                else after
-
-            )
-
-            maximum_error = max(
-
-                maximum_error,
-
-                abs(
-                    value - reference
-                )
-
-            )
-
-        # ----------------------------------------------------
-        # 稳态误差
-        # ----------------------------------------------------
-
-        steady_count = max(
-
-            1,
-
-            int(
-                len(data) * 0.1
-            )
-
-        )
-
-        steady_data = data[
-            -steady_count:
-        ]
-
-        steady_mean = (
-            statistics.mean(
-                steady_data
-            )
-        )
-
-        steady_error = abs(
-
-            steady_mean
-            -
-            after
-
-        )
-
-        # ----------------------------------------------------
-        # 90% 响应时间
-        # ----------------------------------------------------
-
-        target = (
-
-            before
-
-            +
-
-            change * 0.9
-
-        )
-
-        response_index = None
-
-        start = max(
+        "anomaly_count":
             0,
-            change_index - 1
-        )
 
-        for index in range(
-            start,
-            len(data)
-        ):
+        "sample_count":
+            0,
 
-            if data[index] >= target:
-
-                response_index = (
-                    index + 1
-                )
-
-                break
-
-        response_time = None
-
-        if response_index is not None:
-
-            response_time = (
-
-                response_index
-
-                -
-
-                change_index
-
-            )
-
-        return {
-
-            "sample_count":
-                len(data),
-
-            "mean":
-                mean_value,
-
-            "std":
-                std_value,
-
-            "minimum":
-                minimum,
-
-            "maximum":
-                maximum,
-
-            "peak_to_peak":
-                peak_to_peak,
-
-            "change_value":
-                change,
-
-            "maximum_error":
-                maximum_error,
-
-            "steady_mean":
-                steady_mean,
-
-            "steady_error":
-                steady_error,
-
-            "response_time":
-                response_time
-
-        }
+        "connected":
+            False
+    }
 
 
 # ============================================================
-# 10. 移动平均
+# 获取传感器
 # ============================================================
 
-def moving_average(
-    data,
-    window
-):
+try:
 
-    if window <= 0:
+    available_sensors = get_sensors()
 
-        raise ValueError(
-            "窗口必须大于 0。"
-        )
+except Exception as error:
 
-    result = []
+    print()
+    print("=" * 60)
+    print("无法连接 API")
+    print("=" * 60)
+    print(error)
+    print()
+    print(
+        "请确认 API Server 已启动："
+    )
+    print(
+        "http://127.0.0.1:18080"
+    )
+    print()
 
-    buffer = []
+    raise SystemExit
 
-    running_sum = 0.0
 
-    for value in data:
+if not available_sensors:
 
-        buffer.append(
-            value
-        )
+    print("没有发现传感器。")
 
-        running_sum += value
-
-        if len(buffer) > window:
-
-            running_sum -= (
-                buffer.pop(0)
-            )
-
-        result.append(
-
-            running_sum
-            /
-            len(buffer)
-
-        )
-
-    return result
+    raise SystemExit
 
 
 # ============================================================
-# 11. 分析结果窗口
+# 初始化缓存
 # ============================================================
 
-def show_results(
-    gui,
-    stats
-):
+sensor_buffers = {}
 
-    window = gui.create_window(
-        "数据分析结果",
-        650,
-        650
+for sensor in available_sensors:
+
+    sensor_buffers[sensor] = \
+        create_sensor_buffer()
+
+
+current_sensor = available_sensors[0]
+
+running = True
+
+api_connected = False
+
+
+# ============================================================
+# 控制台
+# ============================================================
+
+print()
+print("=" * 65)
+print(
+    "Dynamic Measurement Analyzer"
+)
+print(
+    "实时多传感器测量分析器 v5.0"
+)
+print("=" * 65)
+
+print()
+
+print("发现传感器：")
+
+for sensor in available_sensors:
+
+    print(
+        f"  ● {sensor}"
     )
 
-    tk.Label(
-        window,
-        text="测量数据分析结果",
-        font=FONT_TITLE
-    ).pack(
-        pady=(20, 20)
+print()
+
+print(
+    f"当前传感器：{current_sensor}"
+)
+
+print("=" * 65)
+
+
+# ============================================================
+# 创建 Figure
+# ============================================================
+
+figure = plt.figure(
+    figsize=(15, 9),
+    dpi=120
+)
+
+figure.canvas.manager.set_window_title(
+    "Dynamic Measurement Analyzer v5.0"
+)
+
+
+# ============================================================
+# GridSpec
+#
+# 左侧：
+#   曲线
+#   表格
+#
+# 右侧：
+#   状态卡片
+#   传感器选择
+#   控制按钮
+# ============================================================
+
+grid = GridSpec(
+    12,
+    12,
+    figure=figure,
+    left=0.055,
+    right=0.965,
+    top=0.94,
+    bottom=0.07,
+    wspace=1.0,
+    hspace=1.4
+)
+
+
+# ============================================================
+# 曲线区域
+# ============================================================
+
+axis = figure.add_subplot(
+    grid[0:7, 0:9]
+)
+
+axis.set_title(
+    "实时测量曲线 / Real-Time Measurement",
+    fontsize=15,
+    fontweight="bold",
+    pad=12
+)
+
+axis.set_xlabel(
+    "时间 / Time (s)",
+    fontsize=11
+)
+
+axis.set_ylabel(
+    "测量值 / Measurement",
+    fontsize=11
+)
+
+axis.grid(
+    True,
+    linestyle="--",
+    alpha=0.25
+)
+
+axis.xaxis.set_major_locator(
+    MaxNLocator(nbins=8)
+)
+
+axis.yaxis.set_major_locator(
+    MaxNLocator(nbins=8)
+)
+
+axis.tick_params(
+    labelsize=9
+)
+
+
+# ============================================================
+# 曲线
+# ============================================================
+
+raw_line, = axis.plot(
+    [],
+    [],
+    marker="o",
+    markersize=3,
+    linewidth=1.2,
+    label="原始数据 Raw",
+    antialiased=True
+)
+
+filtered_line, = axis.plot(
+    [],
+    [],
+    linewidth=2.5,
+    label="移动平均 Filtered",
+    antialiased=True
+)
+
+axis.legend(
+    loc="upper left",
+    fontsize=9,
+    framealpha=0.9
+)
+
+
+# ============================================================
+# 数据表格区域
+# ============================================================
+
+table_axis = figure.add_subplot(
+    grid[8:12, 0:9]
+)
+
+table_axis.axis(
+    "off"
+)
+
+table_axis.set_title(
+    "实时数据 / Live Data",
+    fontsize=12,
+    fontweight="bold",
+    loc="left",
+    pad=8
+)
+
+
+# ============================================================
+# 状态卡片区域
+# ============================================================
+
+card_axis = figure.add_subplot(
+    grid[0:4, 9:12]
+)
+
+card_axis.axis(
+    "off"
+)
+
+card_axis.text(
+    0.02,
+    0.92,
+    "传感器状态",
+    fontsize=13,
+    fontweight="bold",
+    transform=card_axis.transAxes
+)
+
+
+sensor_card_text = card_axis.text(
+    0.03,
+    0.72,
+    "",
+    fontsize=10.5,
+    verticalalignment="top",
+    transform=card_axis.transAxes,
+    linespacing=1.6
+)
+
+
+# ============================================================
+# 传感器选择
+# ============================================================
+
+sensor_axis = figure.add_subplot(
+    grid[4:7, 9:12]
+)
+
+sensor_axis.set_title(
+    "传感器选择",
+    fontsize=11,
+    pad=8
+)
+
+sensor_radio = RadioButtons(
+    sensor_axis,
+    available_sensors,
+    active=available_sensors.index(
+        current_sensor
+    )
+)
+
+for label in sensor_radio.labels:
+
+    label.set_fontsize(9)
+
+
+# ============================================================
+# 控制区域
+# ============================================================
+
+control_axis = figure.add_subplot(
+    grid[7:12, 9:12]
+)
+
+control_axis.axis(
+    "off"
+)
+
+
+# ============================================================
+# 按钮
+# ============================================================
+
+pause_axis = figure.add_axes(
+    [
+        0.755,
+        0.285,
+        0.18,
+        0.045
+    ]
+)
+
+pause_button = Button(
+    pause_axis,
+    "暂停刷新"
+)
+
+
+clear_axis = figure.add_axes(
+    [
+        0.755,
+        0.225,
+        0.18,
+        0.045
+    ]
+)
+
+clear_button = Button(
+    clear_axis,
+    "清空曲线"
+)
+
+
+export_axis = figure.add_axes(
+    [
+        0.755,
+        0.165,
+        0.18,
+        0.045
+    ]
+)
+
+export_button = Button(
+    export_axis,
+    "导出 CSV"
+)
+
+
+# ============================================================
+# 底部信息
+# ============================================================
+
+statistics_text = figure.text(
+    0.055,
+    0.025,
+    "平均值：--    标准差：--    异常点：0",
+    fontsize=10
+)
+
+
+api_text = figure.text(
+    0.70,
+    0.025,
+    "API：● 连接中",
+    fontsize=10
+)
+
+
+# ============================================================
+# 表格对象
+# ============================================================
+
+data_table = None
+
+
+# ============================================================
+# 创建表格
+# ============================================================
+
+def rebuild_table():
+
+    global data_table
+
+    table_axis.clear()
+
+    table_axis.axis(
+        "off"
     )
 
-    frame = tk.Frame(
-        window
+    table_axis.set_title(
+        "实时数据 / Live Data",
+        fontsize=12,
+        fontweight="bold",
+        loc="left",
+        pad=8
     )
 
-    frame.pack(
-        fill="both",
-        expand=True,
-        padx=40
-    )
-
-    results = [
-
-        (
-            "样本数量",
-            f"{stats['sample_count']}"
-        ),
-
-        (
-            "平均值",
-            f"{stats['mean']:.4f} mm"
-        ),
-
-        (
-            "标准差",
-            f"{stats['std']:.4f} mm"
-        ),
-
-        (
-            "最小值",
-            f"{stats['minimum']:.4f} mm"
-        ),
-
-        (
-            "最大值",
-            f"{stats['maximum']:.4f} mm"
-        ),
-
-        (
-            "峰峰值",
-            f"{stats['peak_to_peak']:.4f} mm"
-        ),
-
-        (
-            "真实变化量",
-            f"{stats['change_value']:.4f} mm"
-        ),
-
-        (
-            "最大绝对误差",
-            f"{stats['maximum_error']:.4f} mm"
-        ),
-
-        (
-            "稳态平均值",
-            f"{stats['steady_mean']:.4f} mm"
-        ),
-
-        (
-            "稳态误差",
-            f"{stats['steady_error']:.4f} mm"
-        )
-
+    buffer = sensor_buffers[
+        current_sensor
     ]
 
-    if (
-        stats["response_time"]
-        is None
+    timestamps = list(
+        buffer["timestamps"]
+    )
+
+    raw_values = list(
+        buffer["raw"]
+    )
+
+    filtered_values = list(
+        buffer["filtered"]
+    )
+
+    rows = []
+
+    count = len(raw_values)
+
+    start_index = max(
+        0,
+        count - TABLE_ROWS
+    )
+
+    for i in range(
+        start_index,
+        count
     ):
 
-        response_text = (
-            "未达到 90%"
+        timestamp = (
+            datetime.fromtimestamp(
+                timestamps[i]
+            ).strftime(
+                "%H:%M:%S"
+            )
+        )
+
+        rows.append(
+            [
+                i + 1,
+                timestamp,
+                f"{raw_values[i]:.4f}",
+                f"{filtered_values[i]:.4f}",
+                buffer["unit"]
+            ]
+        )
+
+    if not rows:
+
+        rows = [
+            [
+                "--",
+                "--",
+                "--",
+                "--",
+                "--"
+            ]
+        ]
+
+    data_table = table_axis.table(
+        cellText=rows,
+        colLabels=[
+            "序号",
+            "时间",
+            "原始值",
+            "滤波值",
+            "单位"
+        ],
+        cellLoc="center",
+        colLoc="center",
+        bbox=[
+            0,
+            0.02,
+            1,
+            0.82
+        ]
+    )
+
+    data_table.auto_set_font_size(
+        False
+    )
+
+    data_table.set_fontsize(
+        9
+    )
+
+    for cell in data_table.get_celld().values():
+
+        cell.set_height(
+            0.12
+        )
+
+
+# ============================================================
+# 传感器切换
+# ============================================================
+
+def change_sensor(label):
+
+    global current_sensor
+
+    current_sensor = label
+
+    print(
+        f"切换传感器：{current_sensor}"
+    )
+
+    update_ui()
+
+
+sensor_radio.on_clicked(
+    change_sensor
+)
+
+
+# ============================================================
+# 暂停 / 继续
+# ============================================================
+
+def toggle_pause(event):
+
+    global running
+
+    running = not running
+
+    if running:
+
+        pause_button.label.set_text(
+            "暂停刷新"
+        )
+
+        sensor_buffers[
+            current_sensor
+        ]["status"] = \
+            "正在追赶数据..."
+
+        print(
+            "实时刷新：继续"
         )
 
     else:
 
-        response_text = (
-
-            f"{stats['response_time']} "
-            f"samples"
-
+        pause_button.label.set_text(
+            "继续刷新"
         )
 
-    results.append(
+        sensor_buffers[
+            current_sensor
+        ]["status"] = \
+            "已暂停"
 
-        (
-            "90%响应时间",
-            response_text
+        print(
+            "实时刷新：暂停"
         )
 
-    )
+    update_ui()
 
-    for name, value in results:
+    figure.canvas.draw_idle()
 
-        row = tk.Frame(
-            frame
-        )
 
-        row.pack(
-            fill="x",
-            pady=6
-        )
-
-        tk.Label(
-            row,
-            text=name,
-            font=FONT_HEADER,
-            width=18,
-            anchor="w"
-        ).pack(
-            side="left"
-        )
-
-        tk.Label(
-            row,
-            text=value,
-            font=FONT_NORMAL,
-            anchor="w"
-        ).pack(
-            side="left"
-        )
-
-    def close():
-
-        window.destroy()
-
-    tk.Button(
-        window,
-        text="查看动态响应曲线",
-        command=close,
-        width=20,
-        font=FONT_NORMAL
-    ).pack(
-        pady=20
-    )
-
-    window.bind(
-        "<Return>",
-        lambda e: close()
-    )
-
-    window.bind(
-        "<Escape>",
-        lambda e: close()
-    )
-
-    window.grab_set()
-
-    window.focus_force()
-
-    gui.root.wait_window(
-        window
-    )
+pause_button.on_clicked(
+    toggle_pause
+)
 
 
 # ============================================================
-# 12. 动态响应曲线
+# 清空数据
 # ============================================================
 
-def plot_dynamic_response(
-    data,
-    config,
-    timestamps=None
-):
+def clear_data(event):
 
-    if timestamps is None:
+    buffer = sensor_buffers[
+        current_sensor
+    ]
 
-        timestamps = []
+    buffer[
+        "timestamps"
+    ].clear()
 
-    plt.figure(
-        figsize=(10, 6)
+    buffer[
+        "raw"
+    ].clear()
+
+    buffer[
+        "filtered"
+    ].clear()
+
+    buffer[
+        "all_raw"
+    ].clear()
+
+    buffer[
+        "all_filtered"
+    ].clear()
+
+    buffer[
+        "filter_buffer"
+    ].clear()
+
+    buffer[
+        "last_timestamp"
+    ] = None
+
+    buffer[
+        "last_value"
+    ] = 0.0
+
+    buffer[
+        "last_filtered"
+    ] = 0.0
+
+    buffer[
+        "rate"
+    ] = 0.0
+
+    buffer[
+        "anomaly_count"
+    ] = 0
+
+    buffer[
+        "sample_count"
+    ] = 0
+
+    buffer[
+        "status"
+    ] = "等待数据"
+
+    raw_line.set_data(
+        [],
+        []
     )
 
-    # --------------------------------------------------------
-    # X轴
-    # --------------------------------------------------------
-
-    x = range(
-        1,
-        len(data) + 1
+    filtered_line.set_data(
+        [],
+        []
     )
 
-    # --------------------------------------------------------
-    # 原始数据
-    # --------------------------------------------------------
+    axis.relim()
 
-    plt.plot(
+    axis.autoscale_view()
 
-        x,
-
-        data,
-
-        label="Raw Data",
-
-        alpha=0.45
-
+    print(
+        f"已清空 {current_sensor} 数据"
     )
 
-    # --------------------------------------------------------
-    # 移动平均
-    # --------------------------------------------------------
+    rebuild_table()
 
-    for window in (
-        config.windows
-    ):
+    update_ui()
 
-        filtered = moving_average(
+    figure.canvas.draw_idle()
 
-            data,
 
-            window
+clear_button.on_clicked(
+    clear_data
+)
 
+
+# ============================================================
+# CSV 导出
+# ============================================================
+
+def export_csv(event):
+
+    buffer = sensor_buffers[
+        current_sensor
+    ]
+
+    timestamps = list(
+        buffer["timestamps"]
+    )
+
+    raw = list(
+        buffer["raw"]
+    )
+
+    filtered = list(
+        buffer["filtered"]
+    )
+
+    if not raw:
+
+        print(
+            "没有数据可以导出。"
         )
 
-        plt.plot(
+        return
 
-            x,
-
-            filtered,
-
-            label=f"Window {window}"
-
-        )
-
-    # --------------------------------------------------------
-    # 真实变化点
-    # --------------------------------------------------------
-
-    plt.axvline(
-
-        config.true_change_index,
-
-        linestyle="--",
-
-        label="True Change"
-
+    filename = (
+        f"{current_sensor}_"
+        f"{datetime.now():%Y%m%d_%H%M%S}.csv"
     )
 
-    # --------------------------------------------------------
-    # 真实值
-    # --------------------------------------------------------
-
-    plt.axhline(
-
-        config.true_value_before,
-
-        linestyle=":"
-
-    )
-
-    plt.axhline(
-
-        config.true_value_after,
-
-        linestyle=":"
-
-    )
-
-    # --------------------------------------------------------
-    # 标签
-    # --------------------------------------------------------
-
-    plt.xlabel(
-        "Measurement Index"
-    )
-
-    plt.ylabel(
-        "Distance (mm)"
-    )
-
-    plt.title(
-        "Dynamic Response of Moving Average Filters"
-    )
-
-    plt.grid(
-        True
-    )
-
-    plt.legend()
-
-    plt.tight_layout()
-
-    plt.show()
-
-
-# ============================================================
-# 13. 主程序
-# ============================================================
-
-def main():
-
-    root = tk.Tk()
-
-    root.withdraw()
-
-    gui = GUIHelper(
-        root
+    filepath = os.path.abspath(
+        filename
     )
 
     try:
 
-        # ====================================================
-        # 选择数据源
-        # ====================================================
+        with open(
+            filepath,
+            "w",
+            newline="",
+            encoding="utf-8-sig"
+        ) as file:
 
-        source = select_data_source(
-            gui
-        )
-
-        if not source:
-
-            return
-
-        file_path = ""
-
-        selected_sheet = ""
-
-        selected_column = ""
-
-        timestamps = []
-
-        # ====================================================
-        # CSV
-        # ====================================================
-
-        if source == "CSV":
-
-            file_path = (
-                filedialog
-                .askopenfilename(
-
-                    title="选择 CSV 数据文件",
-
-                    filetypes=[
-                        (
-                            "CSV 文件",
-                            "*.csv"
-                        )
-                    ]
-
-                )
+            writer = csv.writer(
+                file
             )
 
-            if not file_path:
-
-                return
-
-            headers = (
-                DataLoader
-                .get_csv_headers(
-                    file_path
-                )
+            writer.writerow(
+                [
+                    "Timestamp",
+                    "Sensor",
+                    "Raw",
+                    "Filtered",
+                    "Unit"
+                ]
             )
 
-            if (
-                "Measurement_mm"
-                in headers
+            for i in range(
+                len(raw)
             ):
 
-                selected_column = (
-                    "Measurement_mm"
-                )
-
-            else:
-
-                selected_column = (
-                    select_from_list(
-
-                        gui,
-
-                        "选择数据列",
-
-                        "请选择用于分析的数据列：",
-
-                        headers
-
+                timestamp_string = \
+                    datetime.fromtimestamp(
+                        timestamps[i]
+                    ).strftime(
+                        "%Y-%m-%d %H:%M:%S"
                     )
-                )
 
-            if not selected_column:
-
-                return
-
-            selected_sheet = "CSV"
-
-            data = (
-                DataLoader
-                .load_csv(
-
-                    file_path,
-
-                    selected_column
-
-                )
-            )
-
-        # ====================================================
-        # Excel
-        # ====================================================
-
-        elif source == "Excel":
-
-            file_path = (
-                filedialog
-                .askopenfilename(
-
-                    title="选择 Excel 数据文件",
-
-                    filetypes=[
-                        (
-                            "Excel 文件",
-                            "*.xlsx"
-                        )
+                writer.writerow(
+                    [
+                        timestamp_string,
+                        current_sensor,
+                        f"{raw[i]:.6f}",
+                        f"{filtered[i]:.6f}",
+                        buffer["unit"]
                     ]
-
                 )
-            )
-
-            if not file_path:
-
-                return
-
-            sheets = (
-                DataLoader
-                .get_excel_sheets(
-                    file_path
-                )
-            )
-
-            selected_sheet = (
-                select_from_list(
-
-                    gui,
-
-                    "选择工作表",
-
-                    "请选择需要分析的 Excel 工作表：",
-
-                    sheets
-
-                )
-            )
-
-            if not selected_sheet:
-
-                return
-
-            headers = (
-                DataLoader
-                .get_excel_headers(
-
-                    file_path,
-
-                    selected_sheet
-
-                )
-            )
-
-            if not headers:
-
-                raise ValueError(
-                    "当前工作表没有有效表头。"
-                )
-
-            selected_column = (
-                select_from_list(
-
-                    gui,
-
-                    "选择数据列",
-
-                    "请选择用于分析的数据列：",
-
-                    headers
-
-                )
-            )
-
-            if not selected_column:
-
-                return
-
-            data = (
-                DataLoader
-                .load_excel(
-
-                    file_path,
-
-                    selected_sheet,
-
-                    selected_column
-
-                )
-            )
-
-        # ====================================================
-        # C++ API
-        # ====================================================
-
-        else:
-
-            records = (
-                DataLoader
-                .load_api(
-
-                    CONFIG.api_url
-
-                )
-            )
-
-            # -----------------------------------------------
-            # 提取数值
-            # -----------------------------------------------
-
-            data = [
-
-                item["value"]
-
-                for item in records
-
-            ]
-
-            # -----------------------------------------------
-            # 提取时间戳
-            # -----------------------------------------------
-
-            timestamps = [
-
-                item["timestamp"]
-
-                for item in records
-
-            ]
-
-            selected_sheet = (
-                "C++ API"
-            )
-
-            selected_column = (
-                "Measurement"
-            )
-
-        # ====================================================
-        # 数据检查
-        # ====================================================
-
-        if not data:
-
-            raise ValueError(
-                "没有读取到有效的数值数据。"
-            )
 
         print()
-
-        print(
-            "=" * 65
-        )
-
-        print(
-            "Dynamic Experiment "
-            "Data Analyzer v3.1"
-        )
-
-        print(
-            "=" * 65
-        )
-
-        print(
-            f"数据源：{source}"
-        )
-
-        if file_path:
-
-            print(
-                f"文件："
-                f"{os.path.basename(file_path)}"
-            )
-
-        print(
-            f"Sheet："
-            f"{selected_sheet}"
-        )
-
-        print(
-            f"数据列："
-            f"{selected_column}"
-        )
-
-        print(
-            f"样本数量："
-            f"{len(data)}"
-        )
-
-        # ----------------------------------------------------
-        # API 时间戳
-        # ----------------------------------------------------
-
-        if timestamps:
-
-            print(
-                f"第一条时间："
-                f"{timestamps[0]}"
-            )
-
-            print(
-                f"最后一条时间："
-                f"{timestamps[-1]}"
-            )
-
-        print(
-            "=" * 65
-        )
-
-        # ====================================================
-        # 数据预览
-        # ====================================================
-
-        if not preview_data(
-
-            gui,
-
-            source,
-
-            file_path,
-
-            selected_sheet,
-
-            selected_column,
-
-            data,
-
-            timestamps
-
-        ):
-
-            return
-
-        # ====================================================
-        # 实验参数
-        # ====================================================
-
-        if not experiment_parameter_window(
-
-            gui,
-
-            CONFIG
-
-        ):
-
-            return
-
-        # ====================================================
-        # 数据分析
-        # ====================================================
-
-        analyzer = DataAnalyzer(
-            CONFIG
-        )
-
-        statistics_result = (
-            analyzer.calculate(
-                data
-            )
-        )
-
-        # ====================================================
-        # 显示结果
-        # ====================================================
-
-        show_results(
-
-            gui,
-
-            statistics_result
-
-        )
-
-        # ====================================================
-        # 动态曲线
-        # ====================================================
-
-        plot_dynamic_response(
-
-            data,
-
-            CONFIG,
-
-            timestamps
-
-        )
+        print("=" * 60)
+        print("CSV 导出成功")
+        print(filepath)
+        print("=" * 60)
 
     except Exception as error:
 
-        messagebox.showerror(
-
-            "程序错误",
-
-            str(error)
-
-        )
-
-        print()
-
         print(
-            "ERROR:"
-        )
-
-        print(
+            "CSV 导出失败：",
             error
         )
 
-    finally:
 
-        root.destroy()
+export_button.on_clicked(
+    export_csv
+)
 
 
 # ============================================================
-# 14. 程序入口
+# 处理数据
 # ============================================================
 
-if __name__ == "__main__":
+def process_data(
+    buffer,
+    timestamp_string,
+    value
+):
 
-    main()
+    try:
+
+        timestamp = datetime.strptime(
+            timestamp_string,
+            "%Y-%m-%d %H:%M:%S"
+        ).timestamp()
+
+    except Exception:
+
+        timestamp = time.time()
+
+
+    # ========================================================
+    # 重复数据
+    # ========================================================
+
+    if (
+        buffer["last_timestamp"]
+        ==
+        timestamp_string
+    ):
+
+        return False
+
+
+    # ========================================================
+    # Hampel
+    # ========================================================
+
+    anomaly = hampel_is_anomaly(
+        buffer["all_raw"],
+        value
+    )
+
+
+    if anomaly:
+
+        buffer[
+            "status"
+        ] = "异常 / ANOMALY"
+
+        buffer[
+            "anomaly_count"
+        ] += 1
+
+    else:
+
+        buffer[
+            "status"
+        ] = "正常 / OK"
+
+
+    # ========================================================
+    # 移动平均
+    # ========================================================
+
+    if not anomaly:
+
+        buffer[
+            "filter_buffer"
+        ].append(
+            value
+        )
+
+
+    if buffer[
+        "filter_buffer"
+    ]:
+
+        filtered_value = (
+            sum(
+                buffer[
+                    "filter_buffer"
+                ]
+            )
+            /
+            len(
+                buffer[
+                    "filter_buffer"
+                ]
+            )
+        )
+
+    else:
+
+        filtered_value = value
+
+
+    # ========================================================
+    # 采样率
+    # ========================================================
+
+    if buffer["timestamps"]:
+
+        dt = (
+            timestamp
+            -
+            buffer["timestamps"][-1]
+        )
+
+        if dt > 0:
+
+            buffer["rate"] = \
+                1.0 / dt
+
+
+    # ========================================================
+    # 保存
+    # ========================================================
+
+    buffer[
+        "timestamps"
+    ].append(
+        timestamp
+    )
+
+    buffer[
+        "raw"
+    ].append(
+        value
+    )
+
+    buffer[
+        "filtered"
+    ].append(
+        filtered_value
+    )
+
+    buffer[
+        "all_raw"
+    ].append(
+        value
+    )
+
+    buffer[
+        "all_filtered"
+    ].append(
+        filtered_value
+    )
+
+    buffer[
+        "last_timestamp"
+    ] = timestamp_string
+
+    buffer[
+        "last_value"
+    ] = value
+
+    buffer[
+        "last_filtered"
+    ] = filtered_value
+
+    buffer[
+        "sample_count"
+    ] += 1
+
+    buffer[
+        "unit"
+    ] = "mm"
+
+
+    return True
+
+
+# ============================================================
+# 获取数据
+# ============================================================
+
+def update_data():
+
+    global api_connected
+
+    buffer = sensor_buffers[
+        current_sensor
+    ]
+
+    try:
+
+        result = get_sensor_data(
+            current_sensor
+        )
+
+        api_connected = True
+
+        buffer[
+            "connected"
+        ] = True
+
+        data = result.get(
+            "data",
+            []
+        )
+
+        if not data:
+
+            buffer[
+                "status"
+            ] = "暂无数据"
+
+            return
+
+
+        # ====================================================
+        # 关键：
+        # 不只读取最后一条
+        #
+        # 这样暂停后继续时，
+        # 可以把暂停期间产生的数据全部追赶回来
+        # ====================================================
+
+        new_count = 0
+
+        for item in data:
+
+            timestamp_string = \
+                item.get(
+                    "timestamp"
+                )
+
+            value = item.get(
+                "value"
+            )
+
+            if (
+                timestamp_string is None
+                or value is None
+            ):
+
+                continue
+
+            try:
+
+                value = float(
+                    value
+                )
+
+            except Exception:
+
+                continue
+
+
+            # ------------------------------------------------
+            # 如果已经存在，跳过
+            # ------------------------------------------------
+
+            if (
+                timestamp_string
+                ==
+                buffer[
+                    "last_timestamp"
+                ]
+            ):
+
+                continue
+
+
+            # ------------------------------------------------
+            # 只追赶 last_timestamp 之后的数据
+            # ------------------------------------------------
+
+            if buffer[
+                "last_timestamp"
+            ] is not None:
+
+                if (
+                    timestamp_string
+                    <=
+                    buffer[
+                        "last_timestamp"
+                    ]
+                ):
+
+                    continue
+
+
+            if process_data(
+                buffer,
+                timestamp_string,
+                value
+            ):
+
+                new_count += 1
+
+
+        if new_count > 0:
+
+            print(
+                f"[{current_sensor}] "
+                f"更新 {new_count} 条数据"
+            )
+
+        elif buffer[
+            "status"
+        ] != "已暂停":
+
+            buffer[
+                "status"
+            ] = "等待新数据"
+
+
+    except requests.exceptions.RequestException:
+
+        api_connected = False
+
+        buffer[
+            "connected"
+        ] = False
+
+        buffer[
+            "status"
+        ] = "API 连接失败"
+
+
+    except Exception as error:
+
+        print(
+            "数据更新错误：",
+            error
+        )
+
+
+# ============================================================
+# UI 更新
+# ============================================================
+
+def update_ui():
+
+    buffer = sensor_buffers[
+        current_sensor
+    ]
+
+
+    # ========================================================
+    # 曲线
+    # ========================================================
+
+    if buffer["timestamps"]:
+
+        first_time = \
+            buffer["timestamps"][0]
+
+        x = [
+            t - first_time
+            for t in buffer["timestamps"]
+        ]
+
+        raw_line.set_data(
+            x,
+            list(buffer["raw"])
+        )
+
+        filtered_line.set_data(
+            x,
+            list(buffer["filtered"])
+        )
+
+        axis.relim()
+
+        axis.autoscale_view()
+
+    else:
+
+        raw_line.set_data(
+            [],
+            []
+        )
+
+        filtered_line.set_data(
+            [],
+            []
+        )
+
+
+    # ========================================================
+    # 状态卡片
+    # ========================================================
+
+    connection_status = (
+        "● 在线"
+        if buffer["connected"]
+        else
+        "● 离线"
+    )
+
+    card_text = (
+        f"传感器\n"
+        f"{current_sensor}\n\n"
+        f"连接状态\n"
+        f"{connection_status}\n\n"
+        f"当前值\n"
+        f"{buffer['last_value']:.3f} "
+        f"{buffer['unit']}\n\n"
+        f"滤波值\n"
+        f"{buffer['last_filtered']:.3f} "
+        f"{buffer['unit']}\n\n"
+        f"采样率\n"
+        f"{buffer['rate']:.2f} Hz\n\n"
+        f"数据点\n"
+        f"{len(buffer['raw'])}\n\n"
+        f"状态\n"
+        f"{buffer['status']}"
+    )
+
+    sensor_card_text.set_text(
+        card_text
+    )
+
+
+    # ========================================================
+    # API
+    # ========================================================
+
+    if api_connected:
+
+        api_text.set_text(
+            "API：● 已连接"
+        )
+
+    else:
+
+        api_text.set_text(
+            "API：● 连接失败"
+        )
+
+
+    # ========================================================
+    # 统计
+    # ========================================================
+
+    if len(
+        buffer["all_raw"]
+    ) > 1:
+
+        mean_value = statistics.mean(
+            buffer["all_raw"]
+        )
+
+        std_value = statistics.stdev(
+            buffer["all_raw"]
+        )
+
+        statistics_text.set_text(
+            f"平均值："
+            f"{mean_value:.3f} "
+            f"{buffer['unit']}"
+            f"    "
+            f"标准差："
+            f"{std_value:.4f} "
+            f"{buffer['unit']}"
+            f"    "
+            f"异常点："
+            f"{buffer['anomaly_count']}"
+        )
+
+    else:
+
+        statistics_text.set_text(
+            "平均值：--    "
+            "标准差：--    "
+            f"异常点："
+            f"{buffer['anomaly_count']}"
+        )
+
+
+    # ========================================================
+    # 表格
+    # ========================================================
+
+    rebuild_table()
+
+
+# ============================================================
+# 动画
+# ============================================================
+
+def animation_update(frame):
+
+    if running:
+
+        update_data()
+
+        update_ui()
+
+    return (
+        raw_line,
+        filtered_line
+    )
+
+
+animation = FuncAnimation(
+    figure,
+    animation_update,
+    interval=REFRESH_INTERVAL,
+    blit=False,
+    cache_frame_data=False
+)
+
+
+# ============================================================
+# 初始化表格
+# ============================================================
+
+rebuild_table()
+
+update_ui()
+
+
+# ============================================================
+# 启动
+# ============================================================
+
+print()
+print("=" * 65)
+print("实时监控已启动")
+print("=" * 65)
+
+print()
+print("功能：")
+print("  ● 多传感器选择")
+print("  ● 实时曲线")
+print("  ● 实时数据表格")
+print("  ● 传感器状态卡片")
+print("  ● 暂停 / 继续")
+print("  ● 暂停后自动追赶数据")
+print("  ● 清空曲线")
+print("  ● CSV 导出")
+print("  ● Hampel 异常检测")
+print("  ● 移动平均滤波")
+print()
+print("关闭窗口即可退出。")
+print()
+
+
+# ============================================================
+# 显示
+#
+# 不调用：
+# focus()
+# lift()
+# topmost
+#
+# 因此不会强制窗口保持置顶
+# ============================================================
+
+plt.show(
+    block=True
+)
+
+
+# ============================================================
+# 退出
+# ============================================================
+
+session.close()
+
+print()
+print("=" * 65)
+print(
+    "Dynamic Measurement Analyzer 已退出"
+)
+print("=" * 65)
