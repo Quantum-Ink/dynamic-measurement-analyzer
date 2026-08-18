@@ -4,22 +4,22 @@
 Dynamic Measurement Analyzer
 实时多传感器测量分析器 v5.0
 
-功能：
+主要功能：
 1. 多传感器选择
-2. 实时曲线
-3. 实时数据表格
-4. 传感器状态卡片
-5. API 自动重连
-6. 暂停 / 继续
-7. 暂停期间数据自动追赶
-8. Hampel 异常检测
-9. 移动平均滤波
-10. 实时采样率
-11. 平均值 / 标准差
-12. CSV 导出
-13. 高清 Matplotlib
-14. 不强制窗口置顶
-15. 每个传感器独立数据缓存
+2. 实时 API 数据刷新
+3. 暂停 / 继续
+4. 暂停后自动追赶历史数据
+5. 实时曲线
+6. 实时数据表格
+7. 传感器状态卡片
+8. CSV 导出
+9. Hampel 异常检测
+10. 移动平均滤波
+11. 实时采样率
+12. 平均值 / 标准差
+13. API 自动重连
+14. 高清 Matplotlib UI
+15. 不强制窗口置顶
 """
 
 import csv
@@ -27,47 +27,14 @@ import os
 import time
 import statistics
 import requests
-import tkinter as tk
-
-from tkinter import filedialog, messagebox
 
 from collections import deque
 from datetime import datetime
 
 import matplotlib
 
-import matplotlib.pyplot as plt
-
-from matplotlib.animation import FuncAnimation
-
-from matplotlib.widgets import Button, RadioButtons
-
-from matplotlib.ticker import MaxNLocator
-
-
 # ============================================================
-# 配置
-# ============================================================
-
-API_BASE_URL = "http://127.0.0.1:18080"
-
-REFRESH_INTERVAL = 1000
-
-MAX_POINTS = 150
-
-TABLE_POINTS = 12
-
-FILTER_WINDOW = 5
-
-HAMPEL_WINDOW = 7
-
-HAMPEL_THRESHOLD = 3.0
-
-REQUEST_TIMEOUT = 2
-
-
-# ============================================================
-# Matplotlib
+# 中文字体
 # ============================================================
 
 matplotlib.rcParams["font.sans-serif"] = [
@@ -80,8 +47,31 @@ matplotlib.rcParams["font.sans-serif"] = [
 matplotlib.rcParams["axes.unicode_minus"] = False
 
 matplotlib.rcParams["figure.dpi"] = 120
-
 matplotlib.rcParams["savefig.dpi"] = 180
+
+import matplotlib.pyplot as plt
+
+from matplotlib.animation import FuncAnimation
+from matplotlib.widgets import Button, RadioButtons
+from matplotlib.ticker import MaxNLocator
+from matplotlib.gridspec import GridSpec
+
+
+# ============================================================
+# 配置
+# ============================================================
+
+API_BASE_URL = "http://127.0.0.1:18080"
+
+REFRESH_INTERVAL = 1000
+
+MAX_POINTS = 150
+
+FILTER_WINDOW = 5
+
+REQUEST_TIMEOUT = 2
+
+TABLE_ROWS = 8
 
 
 # ============================================================
@@ -131,8 +121,8 @@ def get_sensor_data(sensor_name):
 def hampel_is_anomaly(
     data,
     new_value,
-    window_size=HAMPEL_WINDOW,
-    threshold=HAMPEL_THRESHOLD
+    window_size=7,
+    threshold=3.0
 ):
 
     if len(data) < window_size:
@@ -163,7 +153,9 @@ def hampel_is_anomaly(
             ) > 0.001
         )
 
-    robust_sigma = 1.4826 * mad
+    robust_sigma = (
+        1.4826 * mad
+    )
 
     return (
         abs(
@@ -193,12 +185,6 @@ def create_sensor_buffer():
         "filtered":
             deque(maxlen=MAX_POINTS),
 
-        "statuses":
-            deque(maxlen=MAX_POINTS),
-
-        "sequences":
-            deque(maxlen=MAX_POINTS),
-
         "all_raw":
             [],
 
@@ -217,9 +203,6 @@ def create_sensor_buffer():
         "last_filtered":
             0.0,
 
-        "last_sequence":
-            -1,
-
         "unit":
             "mm",
 
@@ -235,7 +218,7 @@ def create_sensor_buffer():
         "sample_count":
             0,
 
-        "api_ok":
+        "connected":
             False
     }
 
@@ -257,7 +240,7 @@ except Exception as error:
     print(error)
     print()
     print(
-        "请确认 API Server 已经启动："
+        "请确认 API Server 已启动："
     )
     print(
         "http://127.0.0.1:18080"
@@ -269,9 +252,7 @@ except Exception as error:
 
 if not available_sensors:
 
-    print(
-        "没有发现传感器。"
-    )
+    print("没有发现传感器。")
 
     raise SystemExit
 
@@ -296,24 +277,22 @@ api_connected = False
 
 
 # ============================================================
-# 启动信息
+# 控制台
 # ============================================================
 
 print()
-print("=" * 70)
+print("=" * 65)
 print(
     "Dynamic Measurement Analyzer"
 )
 print(
     "实时多传感器测量分析器 v5.0"
 )
-print("=" * 70)
+print("=" * 65)
 
 print()
 
-print(
-    "发现传感器："
-)
+print("发现传感器：")
 
 for sensor in available_sensors:
 
@@ -327,37 +306,90 @@ print(
     f"当前传感器：{current_sensor}"
 )
 
-print("=" * 70)
+print("=" * 65)
 
 
 # ============================================================
-# Figure
+# 创建 Figure
 # ============================================================
 
-figure, axis = plt.subplots(
-    figsize=(15, 9)
+figure = plt.figure(
+    figsize=(15, 9),
+    dpi=120
 )
 
-try:
-
-    figure.canvas.manager.set_window_title(
-        "Dynamic Measurement Analyzer v5.0"
-    )
-
-except Exception:
-
-    pass
+figure.canvas.manager.set_window_title(
+    "Dynamic Measurement Analyzer v5.0"
+)
 
 
 # ============================================================
-# 调整布局
+# GridSpec
+#
+# 左侧：
+#   曲线
+#   表格
+#
+# 右侧：
+#   状态卡片
+#   传感器选择
+#   控制按钮
 # ============================================================
 
-figure.subplots_adjust(
-    left=0.07,
-    right=0.78,
-    top=0.78,
-    bottom=0.22
+grid = GridSpec(
+    12,
+    12,
+    figure=figure,
+    left=0.055,
+    right=0.965,
+    top=0.94,
+    bottom=0.07,
+    wspace=1.0,
+    hspace=1.4
+)
+
+
+# ============================================================
+# 曲线区域
+# ============================================================
+
+axis = figure.add_subplot(
+    grid[0:7, 0:9]
+)
+
+axis.set_title(
+    "实时测量曲线 / Real-Time Measurement",
+    fontsize=15,
+    fontweight="bold",
+    pad=12
+)
+
+axis.set_xlabel(
+    "时间 / Time (s)",
+    fontsize=11
+)
+
+axis.set_ylabel(
+    "测量值 / Measurement",
+    fontsize=11
+)
+
+axis.grid(
+    True,
+    linestyle="--",
+    alpha=0.25
+)
+
+axis.xaxis.set_major_locator(
+    MaxNLocator(nbins=8)
+)
+
+axis.yaxis.set_major_locator(
+    MaxNLocator(nbins=8)
+)
+
+axis.tick_params(
+    labelsize=9
 )
 
 
@@ -383,125 +415,10 @@ filtered_line, = axis.plot(
     antialiased=True
 )
 
-
-axis.set_xlabel(
-    "时间 / Time (s)",
-    fontsize=11
-)
-
-axis.set_ylabel(
-    "测量值 / Measurement",
-    fontsize=11
-)
-
-axis.set_title(
-    "实时测量曲线",
-    fontsize=16,
-    fontweight="bold",
-    pad=12
-)
-
-axis.grid(
-    True,
-    alpha=0.25,
-    linestyle="--"
-)
-
-axis.xaxis.set_major_locator(
-    MaxNLocator(nbins=8)
-)
-
-axis.yaxis.set_major_locator(
-    MaxNLocator(nbins=8)
-)
-
-axis.tick_params(
-    labelsize=10
-)
-
 axis.legend(
     loc="upper left",
-    fontsize=10
-)
-
-
-# ============================================================
-# 顶部状态信息
-# ============================================================
-
-sensor_text = figure.text(
-    0.07,
-    0.955,
-    f"传感器：{current_sensor}",
-    fontsize=12,
-    fontweight="bold"
-)
-
-api_text = figure.text(
-    0.35,
-    0.955,
-    "API：● 连接中",
-    fontsize=11
-)
-
-status_text = figure.text(
-    0.62,
-    0.955,
-    "状态：等待数据",
-    fontsize=11
-)
-
-
-# ============================================================
-# 状态卡片
-# ============================================================
-
-value_text = figure.text(
-    0.07,
-    0.895,
-    "当前值\n--",
-    fontsize=13,
-    fontweight="bold",
-    verticalalignment="center"
-)
-
-filtered_text = figure.text(
-    0.24,
-    0.895,
-    "滤波值\n--",
-    fontsize=13,
-    fontweight="bold",
-    verticalalignment="center"
-)
-
-rate_text = figure.text(
-    0.41,
-    0.895,
-    "采样率\n-- Hz",
-    fontsize=13,
-    fontweight="bold",
-    verticalalignment="center"
-)
-
-points_text = figure.text(
-    0.58,
-    0.895,
-    "数据点\n0",
-    fontsize=13,
-    fontweight="bold",
-    verticalalignment="center"
-)
-
-
-# ============================================================
-# 底部统计
-# ============================================================
-
-statistics_text = figure.text(
-    0.07,
-    0.075,
-    "平均值：--    标准差：--    异常点：0",
-    fontsize=10
+    fontsize=9,
+    framealpha=0.9
 )
 
 
@@ -509,23 +426,68 @@ statistics_text = figure.text(
 # 数据表格区域
 # ============================================================
 
-table_axis = figure.add_axes(
-    [0.07, 0.105, 0.70, 0.095]
+table_axis = figure.add_subplot(
+    grid[8:12, 0:9]
 )
 
 table_axis.axis(
     "off"
 )
 
-table = None
+table_axis.set_title(
+    "实时数据 / Live Data",
+    fontsize=12,
+    fontweight="bold",
+    loc="left",
+    pad=8
+)
 
 
 # ============================================================
-# 右侧传感器
+# 状态卡片区域
 # ============================================================
 
-sensor_axis = figure.add_axes(
-    [0.82, 0.55, 0.15, 0.24]
+card_axis = figure.add_subplot(
+    grid[0:4, 9:12]
+)
+
+card_axis.axis(
+    "off"
+)
+
+card_axis.text(
+    0.02,
+    0.92,
+    "传感器状态",
+    fontsize=13,
+    fontweight="bold",
+    transform=card_axis.transAxes
+)
+
+
+sensor_card_text = card_axis.text(
+    0.03,
+    0.72,
+    "",
+    fontsize=10.5,
+    verticalalignment="top",
+    transform=card_axis.transAxes,
+    linespacing=1.6
+)
+
+
+# ============================================================
+# 传感器选择
+# ============================================================
+
+sensor_axis = figure.add_subplot(
+    grid[4:7, 9:12]
+)
+
+sensor_axis.set_title(
+    "传感器选择",
+    fontsize=11,
+    pad=8
 )
 
 sensor_radio = RadioButtons(
@@ -536,19 +498,35 @@ sensor_radio = RadioButtons(
     )
 )
 
-sensor_axis.set_title(
-    "传感器选择",
-    fontsize=11,
-    pad=8
+for label in sensor_radio.labels:
+
+    label.set_fontsize(9)
+
+
+# ============================================================
+# 控制区域
+# ============================================================
+
+control_axis = figure.add_subplot(
+    grid[7:12, 9:12]
+)
+
+control_axis.axis(
+    "off"
 )
 
 
 # ============================================================
-# 右侧按钮
+# 按钮
 # ============================================================
 
 pause_axis = figure.add_axes(
-    [0.82, 0.46, 0.15, 0.055]
+    [
+        0.755,
+        0.285,
+        0.18,
+        0.045
+    ]
 )
 
 pause_button = Button(
@@ -558,7 +536,12 @@ pause_button = Button(
 
 
 clear_axis = figure.add_axes(
-    [0.82, 0.39, 0.15, 0.055]
+    [
+        0.755,
+        0.225,
+        0.18,
+        0.045
+    ]
 )
 
 clear_button = Button(
@@ -568,13 +551,161 @@ clear_button = Button(
 
 
 export_axis = figure.add_axes(
-    [0.82, 0.32, 0.15, 0.055]
+    [
+        0.755,
+        0.165,
+        0.18,
+        0.045
+    ]
 )
 
 export_button = Button(
     export_axis,
     "导出 CSV"
 )
+
+
+# ============================================================
+# 底部信息
+# ============================================================
+
+statistics_text = figure.text(
+    0.055,
+    0.025,
+    "平均值：--    标准差：--    异常点：0",
+    fontsize=10
+)
+
+
+api_text = figure.text(
+    0.70,
+    0.025,
+    "API：● 连接中",
+    fontsize=10
+)
+
+
+# ============================================================
+# 表格对象
+# ============================================================
+
+data_table = None
+
+
+# ============================================================
+# 创建表格
+# ============================================================
+
+def rebuild_table():
+
+    global data_table
+
+    table_axis.clear()
+
+    table_axis.axis(
+        "off"
+    )
+
+    table_axis.set_title(
+        "实时数据 / Live Data",
+        fontsize=12,
+        fontweight="bold",
+        loc="left",
+        pad=8
+    )
+
+    buffer = sensor_buffers[
+        current_sensor
+    ]
+
+    timestamps = list(
+        buffer["timestamps"]
+    )
+
+    raw_values = list(
+        buffer["raw"]
+    )
+
+    filtered_values = list(
+        buffer["filtered"]
+    )
+
+    rows = []
+
+    count = len(raw_values)
+
+    start_index = max(
+        0,
+        count - TABLE_ROWS
+    )
+
+    for i in range(
+        start_index,
+        count
+    ):
+
+        timestamp = (
+            datetime.fromtimestamp(
+                timestamps[i]
+            ).strftime(
+                "%H:%M:%S"
+            )
+        )
+
+        rows.append(
+            [
+                i + 1,
+                timestamp,
+                f"{raw_values[i]:.4f}",
+                f"{filtered_values[i]:.4f}",
+                buffer["unit"]
+            ]
+        )
+
+    if not rows:
+
+        rows = [
+            [
+                "--",
+                "--",
+                "--",
+                "--",
+                "--"
+            ]
+        ]
+
+    data_table = table_axis.table(
+        cellText=rows,
+        colLabels=[
+            "序号",
+            "时间",
+            "原始值",
+            "滤波值",
+            "单位"
+        ],
+        cellLoc="center",
+        colLoc="center",
+        bbox=[
+            0,
+            0.02,
+            1,
+            0.82
+        ]
+    )
+
+    data_table.auto_set_font_size(
+        False
+    )
+
+    data_table.set_fontsize(
+        9
+    )
+
+    for cell in data_table.get_celld().values():
+
+        cell.set_height(
+            0.12
+        )
 
 
 # ============================================================
@@ -592,8 +723,6 @@ def change_sensor(label):
     )
 
     update_ui()
-
-    figure.canvas.draw_idle()
 
 
 sensor_radio.on_clicked(
@@ -617,20 +746,14 @@ def toggle_pause(event):
             "暂停刷新"
         )
 
+        sensor_buffers[
+            current_sensor
+        ]["status"] = \
+            "正在追赶数据..."
+
         print(
             "实时刷新：继续"
         )
-
-        print(
-            "正在追赶暂停期间产生的数据..."
-        )
-
-        # 立即追赶数据
-        update_data(
-            catch_up=True
-        )
-
-        update_ui()
 
     else:
 
@@ -638,9 +761,16 @@ def toggle_pause(event):
             "继续刷新"
         )
 
+        sensor_buffers[
+            current_sensor
+        ]["status"] = \
+            "已暂停"
+
         print(
             "实时刷新：暂停"
         )
+
+    update_ui()
 
     figure.canvas.draw_idle()
 
@@ -651,7 +781,7 @@ pause_button.on_clicked(
 
 
 # ============================================================
-# 清空
+# 清空数据
 # ============================================================
 
 def clear_data(event):
@@ -660,13 +790,57 @@ def clear_data(event):
         current_sensor
     ]
 
-    buffer.clear()
+    buffer[
+        "timestamps"
+    ].clear()
 
-    new_buffer = create_sensor_buffer()
+    buffer[
+        "raw"
+    ].clear()
 
-    sensor_buffers[
-        current_sensor
-    ] = new_buffer
+    buffer[
+        "filtered"
+    ].clear()
+
+    buffer[
+        "all_raw"
+    ].clear()
+
+    buffer[
+        "all_filtered"
+    ].clear()
+
+    buffer[
+        "filter_buffer"
+    ].clear()
+
+    buffer[
+        "last_timestamp"
+    ] = None
+
+    buffer[
+        "last_value"
+    ] = 0.0
+
+    buffer[
+        "last_filtered"
+    ] = 0.0
+
+    buffer[
+        "rate"
+    ] = 0.0
+
+    buffer[
+        "anomaly_count"
+    ] = 0
+
+    buffer[
+        "sample_count"
+    ] = 0
+
+    buffer[
+        "status"
+    ] = "等待数据"
 
     raw_line.set_data(
         [],
@@ -685,6 +859,8 @@ def clear_data(event):
     print(
         f"已清空 {current_sensor} 数据"
     )
+
+    rebuild_table()
 
     update_ui()
 
@@ -706,101 +882,36 @@ def export_csv(event):
         current_sensor
     ]
 
-    if not buffer["raw"]:
+    timestamps = list(
+        buffer["timestamps"]
+    )
+
+    raw = list(
+        buffer["raw"]
+    )
+
+    filtered = list(
+        buffer["filtered"]
+    )
+
+    if not raw:
 
         print(
             "没有数据可以导出。"
         )
 
-        try:
-
-            root = tk.Tk()
-
-            root.withdraw()
-
-            messagebox.showwarning(
-                "没有数据",
-                "当前传感器没有可导出的数据。"
-            )
-
-            root.destroy()
-
-        except Exception:
-
-            pass
-
         return
 
-    default_name = (
+    filename = (
         f"{current_sensor}_"
         f"{datetime.now():%Y%m%d_%H%M%S}.csv"
     )
 
-    try:
-
-        root = tk.Tk()
-
-        root.withdraw()
-
-        root.attributes(
-            "-topmost",
-            True
-        )
-
-        filepath = filedialog.asksaveasfilename(
-
-            parent=root,
-
-            title="导出测量数据",
-
-            initialfile=default_name,
-
-            defaultextension=".csv",
-
-            filetypes=[
-                (
-                    "CSV 文件",
-                    "*.csv"
-                ),
-                (
-                    "所有文件",
-                    "*.*"
-                )
-            ]
-        )
-
-        root.destroy()
-
-    except Exception as error:
-
-        print(
-            "打开保存窗口失败：",
-            error
-        )
-
-        return
-
-    if not filepath:
-
-        print(
-            "已取消 CSV 导出。"
-        )
-
-        return
+    filepath = os.path.abspath(
+        filename
+    )
 
     try:
-
-        timestamps = buffer["timestamps"]
-
-        raw = buffer["raw"]
-
-        filtered = buffer["filtered"]
-
-        sequences = buffer["sequences"]
-
-        statuses = buffer["statuses"]
-
-        first_time = timestamps[0]
 
         with open(
             filepath,
@@ -815,14 +926,11 @@ def export_csv(event):
 
             writer.writerow(
                 [
-                    "Sequence",
                     "Timestamp",
-                    "Relative_Time_s",
                     "Sensor",
                     "Raw",
                     "Filtered",
-                    "Unit",
-                    "Status"
+                    "Unit"
                 ]
             )
 
@@ -830,60 +938,28 @@ def export_csv(event):
                 len(raw)
             ):
 
-                relative_time = (
-                    timestamps[i]
-                    -
-                    first_time
-                )
+                timestamp_string = \
+                    datetime.fromtimestamp(
+                        timestamps[i]
+                    ).strftime(
+                        "%Y-%m-%d %H:%M:%S"
+                    )
 
                 writer.writerow(
                     [
-                        sequences[i],
-                        datetime.fromtimestamp(
-                            timestamps[i]
-                        ).strftime(
-                            "%Y-%m-%d %H:%M:%S"
-                        ),
-                        f"{relative_time:.3f}",
+                        timestamp_string,
                         current_sensor,
                         f"{raw[i]:.6f}",
                         f"{filtered[i]:.6f}",
-                        buffer["unit"],
-                        statuses[i]
+                        buffer["unit"]
                     ]
                 )
 
         print()
-        print("=" * 70)
-        print(
-            "CSV 导出成功"
-        )
-        print(
-            f"文件：{filepath}"
-        )
-        print(
-            f"数据：{len(raw)} 条"
-        )
-        print("=" * 70)
-
-        try:
-
-            root = tk.Tk()
-
-            root.withdraw()
-
-            messagebox.showinfo(
-                "导出成功",
-                f"CSV 已成功导出。\n\n"
-                f"数据：{len(raw)} 条\n"
-                f"文件：\n{filepath}"
-            )
-
-            root.destroy()
-
-        except Exception:
-
-            pass
+        print("=" * 60)
+        print("CSV 导出成功")
+        print(filepath)
+        print("=" * 60)
 
     except Exception as error:
 
@@ -892,23 +968,6 @@ def export_csv(event):
             error
         )
 
-        try:
-
-            root = tk.Tk()
-
-            root.withdraw()
-
-            messagebox.showerror(
-                "导出失败",
-                str(error)
-            )
-
-            root.destroy()
-
-        except Exception:
-
-            pass
-
 
 export_button.on_clicked(
     export_csv
@@ -916,49 +975,71 @@ export_button.on_clicked(
 
 
 # ============================================================
-# 添加单条数据
+# 处理数据
 # ============================================================
 
-def append_data(
+def process_data(
     buffer,
-    sequence,
     timestamp_string,
-    timestamp,
     value
 ):
 
-    # 防止重复
+    try:
+
+        timestamp = datetime.strptime(
+            timestamp_string,
+            "%Y-%m-%d %H:%M:%S"
+        ).timestamp()
+
+    except Exception:
+
+        timestamp = time.time()
+
+
+    # ========================================================
+    # 重复数据
+    # ========================================================
+
     if (
-        buffer["last_sequence"] >= 0
-        and
-        sequence <= buffer["last_sequence"]
+        buffer["last_timestamp"]
+        ==
+        timestamp_string
     ):
 
         return False
 
+
+    # ========================================================
     # Hampel
+    # ========================================================
+
     anomaly = hampel_is_anomaly(
         buffer["all_raw"],
         value
     )
 
+
     if anomaly:
 
-        status = "ANOMALY"
+        buffer[
+            "status"
+        ] = "异常 / ANOMALY"
 
-        buffer["anomaly_count"] += 1
-
-        buffer["status"] = \
-            "异常 / ANOMALY"
+        buffer[
+            "anomaly_count"
+        ] += 1
 
     else:
 
-        status = "OK"
+        buffer[
+            "status"
+        ] = "正常 / OK"
 
-        buffer["status"] = \
-            "正常 / OK"
 
+    # ========================================================
     # 移动平均
+    # ========================================================
+
     if not anomaly:
 
         buffer[
@@ -967,7 +1048,10 @@ def append_data(
             value
         )
 
-    if buffer["filter_buffer"]:
+
+    if buffer[
+        "filter_buffer"
+    ]:
 
         filtered_value = (
             sum(
@@ -987,7 +1071,11 @@ def append_data(
 
         filtered_value = value
 
+
+    # ========================================================
     # 采样率
+    # ========================================================
+
     if buffer["timestamps"]:
 
         dt = (
@@ -1001,59 +1089,70 @@ def append_data(
             buffer["rate"] = \
                 1.0 / dt
 
+
+    # ========================================================
     # 保存
-    buffer["timestamps"].append(
+    # ========================================================
+
+    buffer[
+        "timestamps"
+    ].append(
         timestamp
     )
 
-    buffer["raw"].append(
+    buffer[
+        "raw"
+    ].append(
         value
     )
 
-    buffer["filtered"].append(
+    buffer[
+        "filtered"
+    ].append(
         filtered_value
     )
 
-    buffer["statuses"].append(
-        status
-    )
-
-    buffer["sequences"].append(
-        sequence
-    )
-
-    buffer["all_raw"].append(
+    buffer[
+        "all_raw"
+    ].append(
         value
     )
 
-    buffer["all_filtered"].append(
+    buffer[
+        "all_filtered"
+    ].append(
         filtered_value
     )
 
-    buffer["last_timestamp"] = \
-        timestamp_string
+    buffer[
+        "last_timestamp"
+    ] = timestamp_string
 
-    buffer["last_sequence"] = \
-        sequence
+    buffer[
+        "last_value"
+    ] = value
 
-    buffer["last_value"] = \
-        value
+    buffer[
+        "last_filtered"
+    ] = filtered_value
 
-    buffer["last_filtered"] = \
-        filtered_value
+    buffer[
+        "sample_count"
+    ] += 1
 
-    buffer["sample_count"] += 1
+    buffer[
+        "unit"
+    ] = "mm"
 
-    buffer["unit"] = "mm"
 
     return True
 
 
 # ============================================================
-# 获取新数据
+# 获取数据
 # ============================================================
 
-def update_data(catch_up=False):
+def update_data():
 
     global api_connected
 
@@ -1069,7 +1168,9 @@ def update_data(catch_up=False):
 
         api_connected = True
 
-        buffer["api_ok"] = True
+        buffer[
+            "connected"
+        ] = True
 
         data = result.get(
             "data",
@@ -1078,13 +1179,19 @@ def update_data(catch_up=False):
 
         if not data:
 
-            buffer["status"] = \
-                "暂无数据"
+            buffer[
+                "status"
+            ] = "暂无数据"
 
             return
 
+
         # ====================================================
-        # 正常模式 / 追赶模式
+        # 关键：
+        # 不只读取最后一条
+        #
+        # 这样暂停后继续时，
+        # 可以把暂停期间产生的数据全部追赶回来
         # ====================================================
 
         new_count = 0
@@ -1100,14 +1207,9 @@ def update_data(catch_up=False):
                 "value"
             )
 
-            sequence = item.get(
-                "sequence"
-            )
-
             if (
                 timestamp_string is None
-                or
-                value is None
+                or value is None
             ):
 
                 continue
@@ -1122,115 +1224,78 @@ def update_data(catch_up=False):
 
                 continue
 
-            # =================================================
-            # 如果 API 没有 sequence
-            # =================================================
 
-            if sequence is None:
-
-                if (
-                    buffer["last_timestamp"]
-                    ==
-                    timestamp_string
-                ):
-
-                    continue
-
-                sequence = (
-                    buffer["last_sequence"]
-                    + 1
-                )
-
-            else:
-
-                try:
-
-                    sequence = int(
-                        sequence
-                    )
-
-                except Exception:
-
-                    sequence = (
-                        buffer["last_sequence"]
-                        + 1
-                    )
-
-            # =================================================
-            # 重复数据
-            # =================================================
+            # ------------------------------------------------
+            # 如果已经存在，跳过
+            # ------------------------------------------------
 
             if (
-                buffer["last_sequence"] >= 0
-                and
-                sequence <=
-                buffer["last_sequence"]
+                timestamp_string
+                ==
+                buffer[
+                    "last_timestamp"
+                ]
             ):
 
                 continue
 
-            # =================================================
-            # 时间
-            # =================================================
 
-            try:
+            # ------------------------------------------------
+            # 只追赶 last_timestamp 之后的数据
+            # ------------------------------------------------
 
-                dt = datetime.strptime(
-                    timestamp_string,
-                    "%Y-%m-%d %H:%M:%S"
-                )
+            if buffer[
+                "last_timestamp"
+            ] is not None:
 
-                timestamp = dt.timestamp()
+                if (
+                    timestamp_string
+                    <=
+                    buffer[
+                        "last_timestamp"
+                    ]
+                ):
 
-            except Exception:
+                    continue
 
-                timestamp = time.time()
 
-            # =================================================
-            # 添加
-            # =================================================
-
-            if append_data(
+            if process_data(
                 buffer,
-                sequence,
                 timestamp_string,
-                timestamp,
                 value
             ):
 
                 new_count += 1
 
+
         if new_count > 0:
 
-            if catch_up:
+            print(
+                f"[{current_sensor}] "
+                f"更新 {new_count} 条数据"
+            )
 
-                print(
-                    f"追赶完成："
-                    f"{new_count} 条新数据"
-                )
+        elif buffer[
+            "status"
+        ] != "已暂停":
 
-            else:
+            buffer[
+                "status"
+            ] = "等待新数据"
 
-                print(
-                    f"{current_sensor}："
-                    f"+{new_count} 条"
-                )
-
-        else:
-
-            if not buffer["raw"]:
-
-                buffer["status"] = \
-                    "等待数据"
 
     except requests.exceptions.RequestException:
 
         api_connected = False
 
-        buffer["api_ok"] = False
+        buffer[
+            "connected"
+        ] = False
 
-        buffer["status"] = \
-            "API 连接失败"
+        buffer[
+            "status"
+        ] = "API 连接失败"
+
 
     except Exception as error:
 
@@ -1241,105 +1306,7 @@ def update_data(catch_up=False):
 
 
 # ============================================================
-# 更新数据表
-# ============================================================
-
-def update_table():
-
-    global table
-
-    table_axis.clear()
-
-    table_axis.axis(
-        "off"
-    )
-
-    buffer = sensor_buffers[
-        current_sensor
-    ]
-
-    if not buffer["raw"]:
-
-        table_axis.text(
-            0.5,
-            0.5,
-            "暂无数据",
-            ha="center",
-            va="center",
-            fontsize=10
-        )
-
-        return
-
-    rows = []
-
-    start_index = max(
-        0,
-        len(buffer["raw"])
-        -
-        TABLE_POINTS
-    )
-
-    for i in range(
-        start_index,
-        len(buffer["raw"])
-    ):
-
-        timestamp = \
-            buffer["timestamps"][i]
-
-        rows.append(
-            [
-                str(
-                    buffer["sequences"][i]
-                ),
-                datetime.fromtimestamp(
-                    timestamp
-                ).strftime(
-                    "%H:%M:%S"
-                ),
-                f"{buffer['raw'][i]:.3f}",
-                f"{buffer['filtered'][i]:.3f}",
-                buffer["statuses"][i]
-            ]
-        )
-
-    table = table_axis.table(
-        cellText=rows,
-        colLabels=[
-            "序号",
-            "时间",
-            "原始值",
-            "滤波值",
-            "状态"
-        ],
-        cellLoc="center",
-        colLoc="center",
-        loc="center",
-        bbox=[
-            0,
-            0,
-            1,
-            1
-        ]
-    )
-
-    table.auto_set_font_size(
-        False
-    )
-
-    table.set_fontsize(
-        9
-    )
-
-    table.scale(
-        1,
-        1.25
-    )
-
-
-# ============================================================
-# 更新 UI
+# UI 更新
 # ============================================================
 
 def update_ui():
@@ -1347,6 +1314,7 @@ def update_ui():
     buffer = sensor_buffers[
         current_sensor
     ]
+
 
     # ========================================================
     # 曲线
@@ -1388,13 +1356,45 @@ def update_ui():
             []
         )
 
+
     # ========================================================
-    # 顶部
+    # 状态卡片
     # ========================================================
 
-    sensor_text.set_text(
-        f"传感器：{current_sensor}"
+    connection_status = (
+        "● 在线"
+        if buffer["connected"]
+        else
+        "● 离线"
     )
+
+    card_text = (
+        f"传感器\n"
+        f"{current_sensor}\n\n"
+        f"连接状态\n"
+        f"{connection_status}\n\n"
+        f"当前值\n"
+        f"{buffer['last_value']:.3f} "
+        f"{buffer['unit']}\n\n"
+        f"滤波值\n"
+        f"{buffer['last_filtered']:.3f} "
+        f"{buffer['unit']}\n\n"
+        f"采样率\n"
+        f"{buffer['rate']:.2f} Hz\n\n"
+        f"数据点\n"
+        f"{len(buffer['raw'])}\n\n"
+        f"状态\n"
+        f"{buffer['status']}"
+    )
+
+    sensor_card_text.set_text(
+        card_text
+    )
+
+
+    # ========================================================
+    # API
+    # ========================================================
 
     if api_connected:
 
@@ -1408,41 +1408,14 @@ def update_ui():
             "API：● 连接失败"
         )
 
-    status_text.set_text(
-        f"状态：{buffer['status']}"
-    )
-
-    # ========================================================
-    # 卡片
-    # ========================================================
-
-    value_text.set_text(
-        f"当前值\n"
-        f"{buffer['last_value']:.3f} "
-        f"{buffer['unit']}"
-    )
-
-    filtered_text.set_text(
-        f"滤波值\n"
-        f"{buffer['last_filtered']:.3f} "
-        f"{buffer['unit']}"
-    )
-
-    rate_text.set_text(
-        f"采样率\n"
-        f"{buffer['rate']:.2f} Hz"
-    )
-
-    points_text.set_text(
-        f"数据点\n"
-        f"{len(buffer['raw'])}"
-    )
 
     # ========================================================
     # 统计
     # ========================================================
 
-    if len(buffer["all_raw"]) > 1:
+    if len(
+        buffer["all_raw"]
+    ) > 1:
 
         mean_value = statistics.mean(
             buffer["all_raw"]
@@ -1455,10 +1428,12 @@ def update_ui():
         statistics_text.set_text(
             f"平均值："
             f"{mean_value:.3f} "
-            f"{buffer['unit']}    "
+            f"{buffer['unit']}"
+            f"    "
             f"标准差："
             f"{std_value:.4f} "
-            f"{buffer['unit']}    "
+            f"{buffer['unit']}"
+            f"    "
             f"异常点："
             f"{buffer['anomaly_count']}"
         )
@@ -1472,15 +1447,16 @@ def update_ui():
             f"{buffer['anomaly_count']}"
         )
 
+
     # ========================================================
-    # 数据表
+    # 表格
     # ========================================================
 
-    update_table()
+    rebuild_table()
 
 
 # ============================================================
-# Animation
+# 动画
 # ============================================================
 
 def animation_update(frame):
@@ -1507,52 +1483,49 @@ animation = FuncAnimation(
 
 
 # ============================================================
-# 启动
+# 初始化表格
 # ============================================================
 
-print()
+rebuild_table()
 
-print(
-    "实时监控已启动。"
-)
-
-print()
-
-print(
-    "操作："
-)
-
-print(
-    "  右侧选择传感器"
-)
-
-print(
-    "  暂停刷新"
-)
-
-print(
-    "  继续后自动追赶数据"
-)
-
-print(
-    "  清空当前曲线"
-)
-
-print(
-    "  导出 CSV"
-)
-
-print()
-
-print(
-    "关闭窗口即可退出。"
-)
-
-print()
+update_ui()
 
 
 # ============================================================
 # 启动
+# ============================================================
+
+print()
+print("=" * 65)
+print("实时监控已启动")
+print("=" * 65)
+
+print()
+print("功能：")
+print("  ● 多传感器选择")
+print("  ● 实时曲线")
+print("  ● 实时数据表格")
+print("  ● 传感器状态卡片")
+print("  ● 暂停 / 继续")
+print("  ● 暂停后自动追赶数据")
+print("  ● 清空曲线")
+print("  ● CSV 导出")
+print("  ● Hampel 异常检测")
+print("  ● 移动平均滤波")
+print()
+print("关闭窗口即可退出。")
+print()
+
+
+# ============================================================
+# 显示
+#
+# 不调用：
+# focus()
+# lift()
+# topmost
+#
+# 因此不会强制窗口保持置顶
 # ============================================================
 
 plt.show(
@@ -1567,11 +1540,8 @@ plt.show(
 session.close()
 
 print()
-
-print("=" * 70)
-
+print("=" * 65)
 print(
     "Dynamic Measurement Analyzer 已退出"
 )
-
-print("=" * 70)
+print("=" * 65)
